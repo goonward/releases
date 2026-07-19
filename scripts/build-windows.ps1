@@ -109,12 +109,13 @@ try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::CreateFromDirectory($Stage, $Archive, [IO.Compression.CompressionLevel]::Optimal, $false)
 
+    $Msi = Join-Path $OutputDir "goplus-windows-amd64.msi"
     Push-Location $ReleaseRoot
     try {
         Invoke-Native -File $PrivateGo -Arguments @(
             "run", "./cmd/msi",
             "-payload", $Stage,
-            "-out", (Join-Path $OutputDir "goplus-windows-amd64.msi"),
+            "-out", $Msi,
             "-work", (Join-Path $Work "msi"),
             "-version", $Version,
             "-arch", "amd64"
@@ -122,6 +123,7 @@ try {
     } finally {
         Pop-Location
     }
+    Remove-Item -Force -LiteralPath ([IO.Path]::ChangeExtension($Msi, ".wixpdb")) -ErrorAction SilentlyContinue
 } finally {
     if ($null -eq $OriginalGOROOT) { Remove-Item Env:GOROOT -ErrorAction SilentlyContinue } else { $env:GOROOT = $OriginalGOROOT }
     if ($null -eq $OriginalGOTOOLCHAIN) { Remove-Item Env:GOTOOLCHAIN -ErrorAction SilentlyContinue } else { $env:GOTOOLCHAIN = $OriginalGOTOOLCHAIN }

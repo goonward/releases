@@ -208,8 +208,17 @@ jobs:
             goplus-darwin-arm64.tar.gz
             goplus-install-darwin-arm64
           )
+          declare -A expected=()
           for asset in "${assets[@]}"; do
+            expected[$asset]=1
             test -f "dist/$asset"
+          done
+          for path in dist/*; do
+            name=${path##*/}
+            if [[ ! -f $path || -z ${expected[$name]+present} ]]; then
+              echo "unexpected release asset: $name" >&2
+              exit 1
+            fi
           done
 
       - name: Write checksums
