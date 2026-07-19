@@ -1,0 +1,1522 @@
+diff --git a/internal/analysis/fillswitch/enum_test.go b/internal/analysis/fillswitch/enum_test.go
+new file mode 100644
+index 000000000..138234363
+--- /dev/null
++++ b/internal/analysis/fillswitch/enum_test.go
+@@ -0,0 +1,199 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package fillswitch_test
++
++import (
++	"fmt"
++	"go/ast"
++	"go/parser"
++	"go/token"
++	"go/types"
++	"strings"
++	"testing"
++
++	"golang.org/x/tools/gopls/internal/analysis/fillswitch"
++)
++
++type testImporter map[string]*types.Package
++
++func (m testImporter) Import(path string) (*types.Package, error) {
++	if pkg := m[path]; pkg != nil {
++		return pkg, nil
++	}
++	return nil, fmt.Errorf("package %q not found", path)
++}
++
++func TestEnum(t *testing.T) {
++	const src = `package p
++
++type Option[T any] enum {
++	Some { Value T }
++	None
++}
++
++type Empty enum {}
++
++func use(option Option[string]) {
++	switch option {
++	case Some:
++		_ = option.Value
++	}
++}
++
++func useEmpty(empty Empty) {
++	switch empty {
++	}
++}
++
++type Alias = Option[string]
++
++func useAlias(option Alias) {
++	switch option {
++	}
++}
++`
++	fset := token.NewFileSet()
++	file, err := parser.ParseFile(fset, "enum.go", src, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	info := &types.Info{
++		Types:      make(map[ast.Expr]types.TypeAndValue),
++		Defs:       make(map[*ast.Ident]types.Object),
++		Uses:       make(map[*ast.Ident]types.Object),
++		Implicits:  make(map[ast.Node]types.Object),
++		Scopes:     make(map[ast.Node]*types.Scope),
++		Selections: make(map[*ast.SelectorExpr]*types.Selection),
++	}
++	config := &types.Config{Error: func(error) {}}
++	pkg, _ := config.Check("p", fset, []*ast.File{file}, info)
++	diagnostics := fillswitch.Diagnose(file, token.NoPos, token.NoPos, pkg, info)
++	if len(diagnostics) != 3 {
++		t.Fatalf("got %d diagnostics, want 3", len(diagnostics))
++	}
++	fix := diagnostics[0].SuggestedFixes[0]
++	if len(fix.TextEdits) != 1 {
++		t.Fatalf("got %d edits, want 1", len(fix.TextEdits))
++	}
++	text := string(fix.TextEdits[0].NewText)
++	if !strings.Contains(text, "case None:") || !strings.Contains(text, "case nil:") || strings.Contains(text, "case Some:") {
++		t.Fatalf("enum switch edit = %q", text)
++	}
++	if !strings.HasSuffix(text, "\t") {
++		t.Fatalf("enum switch edit does not preserve closing-brace indentation: %q", text)
++	}
++	emptyFix := diagnostics[1].SuggestedFixes[0]
++	if len(emptyFix.TextEdits) != 1 {
++		t.Fatalf("got %d empty-enum edits, want 1", len(emptyFix.TextEdits))
++	}
++	emptyText := string(emptyFix.TextEdits[0].NewText)
++	if !strings.Contains(emptyText, "case nil:") || strings.Contains(emptyText, "case None:") {
++		t.Fatalf("empty enum switch edit = %q", emptyText)
++	}
++	aliasText := string(diagnostics[2].SuggestedFixes[0].TextEdits[0].NewText)
++	if !strings.Contains(aliasText, "case Some:") || !strings.Contains(aliasText, "case None:") || !strings.Contains(aliasText, "case nil:") {
++		t.Fatalf("aliased enum switch edit = %q", aliasText)
++	}
++}
++
++func TestEnumTypeSwitchCoveringCases(t *testing.T) {
++	const src = `package p
++
++type Result enum { Ok; Err }
++
++func enumCase(result Result) {
++	switch result.(type) {
++	case Result:
++	}
++}
++
++func anyCase(result Result) {
++	switch result.(type) {
++	case any:
++	}
++}
++`
++	fset := token.NewFileSet()
++	file, err := parser.ParseFile(fset, "enum.go", src, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	info := &types.Info{
++		Types:      make(map[ast.Expr]types.TypeAndValue),
++		Defs:       make(map[*ast.Ident]types.Object),
++		Uses:       make(map[*ast.Ident]types.Object),
++		Implicits:  make(map[ast.Node]types.Object),
++		Scopes:     make(map[ast.Node]*types.Scope),
++		Selections: make(map[*ast.SelectorExpr]*types.Selection),
++	}
++	config := &types.Config{Error: func(error) {}}
++	pkg, _ := config.Check("p", fset, []*ast.File{file}, info)
++	diagnostics := fillswitch.Diagnose(file, token.NoPos, token.NoPos, pkg, info)
++	if len(diagnostics) != 2 {
++		t.Fatalf("got %d diagnostics, want 2", len(diagnostics))
++	}
++	for _, diagnostic := range diagnostics {
++		text := string(diagnostic.SuggestedFixes[0].TextEdits[0].NewText)
++		if !strings.Contains(text, "case nil:") || strings.Contains(text, "case Ok:") || strings.Contains(text, "case Err:") {
++			t.Fatalf("covering type-switch edit = %q, want only nil", text)
++		}
++	}
++}
++
++func TestEnumExistingDefault(t *testing.T) {
++	fset := token.NewFileSet()
++	parse := func(name, src string) *ast.File {
++		file, err := parser.ParseFile(fset, name, src, 0)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return file
++	}
++
++	decl := parse("enum.go", `package p; type E enum { A; B; private }`)
++	pkg, err := new(types.Config).Check("p", fset, []*ast.File{decl}, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	use := parse("use.go", `package q
++import "p"
++func use(value p.E) {
++	switch value {
++	case A:
++	default:
++	}
++}
++func useType(value p.E) {
++	switch value.(type) {
++	case A:
++	default:
++	}
++}`)
++	info := &types.Info{
++		Types:      make(map[ast.Expr]types.TypeAndValue),
++		Defs:       make(map[*ast.Ident]types.Object),
++		Uses:       make(map[*ast.Ident]types.Object),
++		Implicits:  make(map[ast.Node]types.Object),
++		Scopes:     make(map[ast.Node]*types.Scope),
++		Selections: make(map[*ast.SelectorExpr]*types.Selection),
++	}
++	consumer, err := (&types.Config{Importer: testImporter{"p": pkg}}).Check("q", fset, []*ast.File{use}, info)
++	if err != nil {
++		t.Fatal(err)
++	}
++	diagnostics := fillswitch.Diagnose(use, token.NoPos, token.NoPos, consumer, info)
++	if len(diagnostics) != 2 {
++		t.Fatalf("got %d diagnostics, want 2", len(diagnostics))
++	}
++	for _, diagnostic := range diagnostics {
++		text := string(diagnostic.SuggestedFixes[0].TextEdits[0].NewText)
++		if !strings.Contains(text, "case B:") || strings.Contains(text, "default:") || strings.Contains(text, "case nil:") {
++			t.Fatalf("enum switch edit = %q, want B without duplicate default or nil", text)
++		}
++		if !strings.HasSuffix(text, "\t") {
++			t.Fatalf("enum switch edit does not preserve closing-brace indentation: %q", text)
++		}
++	}
++}
+diff --git a/internal/analysis/fillswitch/fillswitch.go b/internal/analysis/fillswitch/fillswitch.go
+index 7b1a7e8cb..9658d3d17 100644
+--- a/internal/analysis/fillswitch/fillswitch.go
++++ b/internal/analysis/fillswitch/fillswitch.go
+@@ -10,6 +10,7 @@ import (
+ 	"go/ast"
+ 	"go/token"
+ 	"go/types"
++	"strings"
+ 
+ 	"golang.org/x/tools/go/analysis"
+ 	"golang.org/x/tools/internal/typesinternal"
+@@ -51,14 +52,23 @@ func Diagnose(f *ast.File, start, end token.Pos, pkg *types.Package, info *types
+ }
+ 
+ func suggestedFixTypeSwitch(stmt *ast.TypeSwitchStmt, pkg *types.Package, info *types.Info) *analysis.SuggestedFix {
+-	if hasDefaultCase(stmt.Body) {
+-		return nil
+-	}
+-
+ 	namedType := namedTypeFromTypeSwitch(stmt, info)
+ 	if namedType == nil {
+ 		return nil
+ 	}
++	if enumType := namedType.EnumType(); enumType != nil && enumType.Origin() == namedType.Origin() {
++		var tag ast.Expr
++		switch assign := stmt.Assign.(type) {
++		case *ast.AssignStmt:
++			tag = assign.Rhs[0].(*ast.TypeAssertExpr).X
++		case *ast.ExprStmt:
++			tag = assign.X.(*ast.TypeAssertExpr).X
++		}
++		return suggestedFixEnumSwitch(stmt.End(), stmt.Body, tag, namedType, true, pkg, info)
++	}
++	if hasDefaultCase(stmt.Body) {
++		return nil
++	}
+ 
+ 	existingCases := caseTypes(stmt.Body, info)
+ 	// Gather accessible package-level concrete types
+@@ -136,12 +146,14 @@ func suggestedFixTypeSwitch(stmt *ast.TypeSwitchStmt, pkg *types.Package, info *
+ }
+ 
+ func suggestedFixSwitch(stmt *ast.SwitchStmt, pkg *types.Package, info *types.Info) *analysis.SuggestedFix {
+-	if hasDefaultCase(stmt.Body) {
++	namedType, ok := types.Unalias(info.TypeOf(stmt.Tag)).(*types.Named)
++	if !ok {
+ 		return nil
+ 	}
+-
+-	namedType, ok := info.TypeOf(stmt.Tag).(*types.Named)
+-	if !ok {
++	if enumType := namedType.EnumType(); enumType != nil && enumType.Origin() == namedType.Origin() {
++		return suggestedFixEnumSwitch(stmt.End(), stmt.Body, stmt.Tag, namedType, false, pkg, info)
++	}
++	if hasDefaultCase(stmt.Body) {
+ 		return nil
+ 	}
+ 
+@@ -186,6 +198,89 @@ func suggestedFixSwitch(stmt *ast.SwitchStmt, pkg *types.Package, info *types.In
+ 	}
+ }
+ 
++func suggestedFixEnumSwitch(end token.Pos, body *ast.BlockStmt, tag ast.Expr, namedType *types.Named, typeSwitch bool, pkg *types.Package, info *types.Info) *analysis.SuggestedFix {
++	variants := namedType.EnumVariants()
++
++	var existing []types.Type
++	hasNil := false
++	hasDefault := false
++	for _, stmt := range body.List {
++		clause := stmt.(*ast.CaseClause)
++		if clause.List == nil {
++			hasDefault = true
++		}
++		for _, expr := range clause.List {
++			if id, ok := expr.(*ast.Ident); ok {
++				if _, ok := info.ObjectOf(id).(*types.Nil); ok {
++					hasNil = true
++					continue
++				}
++			}
++			if typ := info.TypeOf(expr); typ != nil {
++				existing = append(existing, typ)
++			}
++		}
++	}
++
++	covered := func(variant types.Type) bool {
++		for _, typ := range existing {
++			if types.Identical(typ, variant) || typeSwitch && types.AssignableTo(variant, typ) {
++				return true
++			}
++		}
++		return false
++	}
++
++	var buf bytes.Buffer
++	inaccessible := false
++	qualifier := typesinternal.NameRelativeTo(pkg)
++	for _, variant := range variants {
++		if covered(variant) {
++			continue
++		}
++		obj := variant.Obj()
++		if obj.Pkg() != pkg && !obj.Exported() {
++			inaccessible = true
++			continue
++		}
++		if buf.Len() > 0 {
++			buf.WriteByte('\t')
++		}
++		name := variant.Obj().Name()
++		if i := strings.LastIndexByte(name, '.'); i >= 0 {
++			name = name[i+1:]
++		}
++		fmt.Fprintf(&buf, "case %s:\n", name)
++	}
++
++	if inaccessible && !hasDefault {
++		if buf.Len() > 0 {
++			buf.WriteByte('\t')
++		}
++		addDefaultCase(&buf, namedType, tag)
++	} else if !hasNil && !hasDefault {
++		if buf.Len() > 0 {
++			buf.WriteByte('\t')
++		}
++		buf.WriteString("case nil:\n")
++	}
++	if buf.Len() == 0 {
++		return nil
++	}
++	if !inaccessible || hasDefault {
++		buf.WriteByte('\t')
++	}
++
++	return &analysis.SuggestedFix{
++		Message: "Add cases for " + types.TypeString(namedType, qualifier),
++		TextEdits: []analysis.TextEdit{{
++			Pos:     end - token.Pos(len("}")),
++			End:     end - token.Pos(len("}")),
++			NewText: buf.Bytes(),
++		}},
++	}
++}
++
+ func addDefaultCase(buf *bytes.Buffer, named *types.Named, expr ast.Expr) {
+ 	var dottedBuf bytes.Buffer
+ 	// writeDotted emits a dotted path a.b.c.
+diff --git a/internal/cache/parsego/resolver.go b/internal/cache/parsego/resolver.go
+index 450fcc0a2..b37933afa 100644
+--- a/internal/cache/parsego/resolver.go
++++ b/internal/cache/parsego/resolver.go
+@@ -319,6 +319,10 @@ func (r *resolver) Visit(node ast.Node) ast.Visitor {
+ 			r.walkExprs(n.Lhs)
+ 		}
+ 
++	case *ast.TryStmt:
++		r.walkExprs(n.Rhs)
++		if len(n.Lhs) > 0 { r.shortVarDecl(&ast.AssignStmt{Lhs: n.Lhs, TokPos: n.TokPos, Tok: token.DEFINE, Rhs: n.Rhs}) }
++
+ 	case *ast.BranchStmt:
+ 		// add to list of unresolved targets
+ 		if n.Tok != token.FALLTHROUGH && n.Label != nil {
+@@ -507,6 +511,28 @@ func (r *resolver) Visit(node ast.Node) ast.Visitor {
+ 			r.declare(n, nil, r.pkgScope, ast.Fun, n.Name)
+ 		}
+ 
++	case *ast.EnumDecl:
++		// The enum name is in the enclosing scope. Variants use an enum-local
++		// scope only for duplicate detection; their constructors are namespaced.
++		r.declare(n, nil, r.topScope, ast.Typ, n.Name)
++		variantScope := ast.NewScope(nil)
++		for _, variant := range n.Variants {
++			r.declare(variant, nil, variantScope, ast.Typ, variant.Name)
++		}
++		if n.TypeParams != nil {
++			r.openScope(n.Pos())
++			defer r.closeScope()
++			r.walkTParams(n.TypeParams)
++		}
++		for _, variant := range n.Variants {
++			if variant.Fields == nil {
++				continue
++			}
++			r.openScope(variant.Pos())
++			r.walkFieldList(variant.Fields, ast.Var)
++			r.closeScope()
++		}
++
+ 	default:
+ 		return r
+ 	}
+diff --git a/internal/cache/parsego/resolver_test.go b/internal/cache/parsego/resolver_test.go
+index 44908b7ec..8fa274b4b 100644
+--- a/internal/cache/parsego/resolver_test.go
++++ b/internal/cache/parsego/resolver_test.go
+@@ -5,7 +5,9 @@
+ package parsego
+ 
+ import (
++	"context"
+ 	"go/ast"
++	"go/token"
+ 	"go/types"
+ 	"os"
+ 	"strings"
+@@ -17,6 +19,25 @@ import (
+ 	"golang.org/x/tools/internal/testenv"
+ )
+ 
++func TestResolveTryStmt(t *testing.T) {
++	const src = `package p
++func load() (int, error) { return 0, nil }
++func get() (int, error) {
++	try value := load()
++	return value, nil
++}
++`
++	pgf, _ := Parse(context.Background(), token.NewFileSet(), "file://try.go", []byte(src), Full, false)
++	pgf.Resolve()
++	fn := pgf.File.Decls[1].(*ast.FuncDecl)
++	stmt := fn.Body.List[0].(*ast.TryStmt)
++	def := stmt.Lhs[0].(*ast.Ident)
++	use := fn.Body.List[1].(*ast.ReturnStmt).Results[0].(*ast.Ident)
++	if def.Obj == nil || use.Obj != def.Obj {
++		t.Fatalf("try binding did not resolve: def=%p use=%p", def.Obj, use.Obj)
++	}
++}
++
+ // TestGoplsSourceDoesNotUseObjectResolution verifies that gopls does not
+ // read fields that are set during syntactic object resolution, except in
+ // locations where we can guarantee that object resolution has occurred. This
+diff --git a/internal/cache/symbols/symbols.go b/internal/cache/symbols/symbols.go
+index baef055f6..0a8d3258f 100644
+--- a/internal/cache/symbols/symbols.go
++++ b/internal/cache/symbols/symbols.go
+@@ -108,6 +108,17 @@ func symbolizeFile(pgf *parsego.File) []Symbol {
+ 					}
+ 				}
+ 			}
++
++		case *ast.EnumDecl:
++			w.declare(decl.Name.Name, protocol.Enum, decl.Name)
++			for _, variant := range decl.Variants {
++				w.declare(variant.Name.Name, protocol.EnumMember, variant.Name, decl.Name)
++				if variant.Fields != nil {
++					for _, field := range variant.Fields.List {
++						w.walkField(field, protocol.Field, protocol.Field, decl.Name, variant.Name)
++					}
++				}
++			}
+ 		}
+ 	}
+ 
+diff --git a/internal/cache/typerefs/refs.go b/internal/cache/typerefs/refs.go
+index 3b9763edd..eb994c40c 100644
+--- a/internal/cache/typerefs/refs.go
++++ b/internal/cache/typerefs/refs.go
+@@ -168,16 +168,23 @@ func index(pgfs []*parsego.File, imports map[metadata.ImportPath]*metadata.Packa
+ 	// In ill-typed code, there may be multiple declarations of the
+ 	// same name; a single declInfo node will represent them all.
+ 	decls := make(map[string]*declNode)
+-	addDecl := func(id *ast.Ident) {
+-		if name := id.Name; name != "_" && decls[name] == nil {
++	addDeclName := func(name string) {
++		if name != "_" && decls[name] == nil {
+ 			node := &declNode{name: name, extRefsClass: -1}
+ 			node.rep = node
+ 			decls[name] = node
+ 		}
+ 	}
++	addDecl := func(id *ast.Ident) { addDeclName(id.Name) }
+ 	for _, pgf := range pgfs {
+ 		for _, d := range pgf.File.Decls {
+ 			switch d := d.(type) {
++			case *ast.EnumDecl:
++				addDecl(d.Name)
++				for _, variant := range d.Variants {
++					addDeclName(d.Name.Name + "." + variant.Name.Name)
++				}
++
+ 			case *ast.GenDecl:
+ 				switch d.Tok {
+ 				case token.TYPE:
+@@ -277,11 +284,11 @@ func visitFile(file *ast.File, imports map[metadata.ImportPath]*metadata.Package
+ 
+ 	// visit finds refs within node and builds edges from fromId's decl.
+ 	// References to the type parameters are ignored.
+-	visit := func(fromId *ast.Ident, node ast.Node, tparams map[string]bool) {
+-		if fromId.Name == "_" {
++	visitName := func(fromName string, node ast.Node, tparams map[string]bool) {
++		if fromName == "_" {
+ 			return
+ 		}
+-		from := decls[fromId.Name]
++		from := decls[fromName]
+ 		// When visiting a method, there may not be a valid type declaration for
+ 		// the receiver. In this case there is no way to refer to the method, so
+ 		// we need not record edges.
+@@ -328,11 +335,21 @@ func visitFile(file *ast.File, imports map[metadata.ImportPath]*metadata.Package
+ 			}
+ 		})
+ 	}
++	visit := func(fromID *ast.Ident, node ast.Node, tparams map[string]bool) {
++		visitName(fromID.Name, node, tparams)
++	}
+ 
+ 	// Visit the declarations and gather reference edges.
+ 	// Import declarations appear before all others.
+ 	for _, d := range file.Decls {
+ 		switch d := d.(type) {
++		case *ast.EnumDecl:
++			tparams := tparamsMap(d.TypeParams)
++			visit(d.Name, d, tparams)
++			for _, variant := range d.Variants {
++				visitName(d.Name.Name+"."+variant.Name.Name, variant, tparams)
++			}
++
+ 		case *ast.GenDecl:
+ 			switch d.Tok {
+ 			case token.IMPORT:
+@@ -454,6 +471,23 @@ func visitDeclOrSpec(node ast.Node, f refVisitor) {
+ 		}
+ 		visitExpr(n.Type, f)
+ 
++	case *ast.EnumDecl:
++		// Skip docs and declared names. Constraints and payload field types
++		// determine the types of the enum and all its variants.
++		if n.TypeParams != nil {
++			visitFieldList(n.TypeParams, f)
++		}
++		for _, variant := range n.Variants {
++			if variant.Fields != nil {
++				visitFieldList(variant.Fields, f)
++			}
++		}
++
++	case *ast.EnumVariant:
++		if n.Fields != nil {
++			visitFieldList(n.Fields, f)
++		}
++
+ 	case *ast.BadDecl:
+ 		// nothing to do
+ 
+diff --git a/internal/cache/typerefs/refs_test.go b/internal/cache/typerefs/refs_test.go
+index 1e98fb585..8d26601b8 100644
+--- a/internal/cache/typerefs/refs_test.go
++++ b/internal/cache/typerefs/refs_test.go
+@@ -453,6 +453,26 @@ var y ext.Y
+ 				"C": {"a.A", "ext.B", "ext.X", "ext.Y"},
+ 			},
+ 		},
++		{
++			label: "enum variants",
++			srcs: []string{`package p
++
++import "ext"
++
++type E enum {
++	A { X ext.X }
++	B { Y ext.Y }
++}
++type F enum { A { Z ext.Z } }
++`},
++			want: map[string][]string{
++				"E":   {"ext.X", "ext.Y"},
++				"E.A": {"ext.X"},
++				"E.B": {"ext.Y"},
++				"F":   {"ext.Z"},
++				"F.A": {"ext.Z"},
++			},
++		},
+ 		{
+ 			label: "invalid decls",
+ 			srcs: []string{`package p
+diff --git a/internal/golang/completion/completion.go b/internal/golang/completion/completion.go
+index 70a1468de..0857c5338 100644
+--- a/internal/golang/completion/completion.go
++++ b/internal/golang/completion/completion.go
+@@ -1344,6 +1344,25 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
+ 
+ 	// True selector?
+ 	if tv, ok := c.pkg.TypesInfo().Types[sel.X]; ok {
++		if tv.IsType() {
++			if named, _ := types.Unalias(tv.Type).(*types.Named); named != nil {
++				if enumType := named.EnumType(); enumType != nil && enumType.Origin() == named.Origin() {
++					for _, variant := range named.EnumVariants() {
++						obj := variant.Obj()
++						name := obj.Name()
++						if i := strings.LastIndexByte(name, '.'); i >= 0 {
++							name = name[i+1:]
++						}
++						if obj.Pkg() == c.pkg.Types() || obj.Exported() {
++							c.deepState.enqueue(candidate{
++								obj:   types.NewTypeName(obj.Pos(), obj.Pkg(), name, variant),
++								score: stdScore,
++							})
++						}
++					}
++				}
++			}
++		}
+ 		c.methodsAndFields(tv.Type, tv.Addressable(), nil, c.deepState.enqueue)
+ 		c.addPostfixSnippetCandidates(ctx, sel)
+ 		return nil
+@@ -1440,6 +1459,9 @@ func (c *completer) methodsAndFields(typ types.Type, addressable bool, imp *impo
+ 
+ 	for method := range mset.Methods() {
+ 		obj := method.Obj()
++		if strings.HasPrefix(obj.Name(), ".enum.") {
++			continue // compiler-generated enum marker
++		}
+ 		// to the other side of the cb() queue?
+ 		if c.tooNew(obj) {
+ 			continue // std method too new for file's Go version
+@@ -2209,6 +2231,11 @@ Nodes:
+ 			inf.objType = objType
+ 			inf.assignees = assignees
+ 			return inf
++		case *ast.TryStmt:
++			objType, assignees := expectedTryStmtTypes(c.pkg, node, c.pos)
++			inf.objType = objType
++			inf.assignees = assignees
++			return inf
+ 		case *ast.ValueSpec:
+ 			inf.objType = expectedValueSpecType(c.pkg, node, c.pos)
+ 			return
+@@ -2425,6 +2452,13 @@ func inferExpectedResultTypes(c *completer, callNodeIdx int) []types.Type {
+ 		} else if objType != nil {
+ 			expectedResults = append(expectedResults, objType)
+ 		}
++	case *ast.TryStmt:
++		objType, assignees := expectedTryStmtTypes(c.pkg, node, c.pos)
++		if len(assignees) > 0 {
++			return assignees
++		} else if objType != nil {
++			expectedResults = append(expectedResults, objType)
++		}
+ 	case *ast.ValueSpec:
+ 		if resultType := expectedValueSpecType(c.pkg, node, c.pos); resultType != nil {
+ 			expectedResults = append(expectedResults, resultType)
+@@ -2523,6 +2557,15 @@ func expectedAssignStmtTypes(pkg *cache.Package, node *ast.AssignStmt, pos token
+ 	return objType, assignees
+ }
+ 
++func expectedTryStmtTypes(pkg *cache.Package, node *ast.TryStmt, pos token.Pos) (objType types.Type, assignees []types.Type) {
++	assignment := &ast.AssignStmt{Lhs: node.Lhs, TokPos: node.TokPos, Tok: token.DEFINE, Rhs: node.Rhs}
++	objType, assignees = expectedAssignStmtTypes(pkg, assignment, pos)
++	if len(node.Rhs) <= 1 && len(assignees) > 0 {
++		assignees = append(assignees, types.Universe.Lookup("error").Type())
++	}
++	return objType, assignees
++}
++
+ // expectedReturnStmtType returns the expected type of a return statement.
+ // Returns nil if enclosingSig is nil.
+ func expectedReturnStmtType(enclosingSig *types.Signature, node *ast.ReturnStmt, pos token.Pos) types.Type {
+diff --git a/internal/golang/completion/postfix_snippets.go b/internal/golang/completion/postfix_snippets.go
+index 084eafe0f..f63a9f1bd 100644
+--- a/internal/golang/completion/postfix_snippets.go
++++ b/internal/golang/completion/postfix_snippets.go
+@@ -547,6 +547,8 @@ func (c *completer) addPostfixSnippetCandidates(ctx context.Context, sel *ast.Se
+ 				// detect that "foo." makes up the entire statement since the
+ 				// apparent selector spans lines.
+ 				stmtOK = safetoken.Line(tokFile, c.pos) < safetoken.Line(tokFile, p.TokPos)
++			case *ast.TryStmt:
++				stmtOK = p.TokPos.IsValid() && safetoken.Line(tokFile, c.pos) < safetoken.Line(tokFile, p.TokPos)
+ 			}
+ 			break
+ 		}
+diff --git a/internal/golang/completion/util.go b/internal/golang/completion/util.go
+index 0b07129ad..447e3da5c 100644
+--- a/internal/golang/completion/util.go
++++ b/internal/golang/completion/util.go
+@@ -206,6 +206,14 @@ func enclosingDeclLHS(path []ast.Node) []*ast.Ident {
+ 				}
+ 			}
+ 			return ids
++		case *ast.TryStmt:
++			ids := make([]*ast.Ident, 0, len(n.Lhs))
++			for _, e := range n.Lhs {
++				if id, ok := e.(*ast.Ident); ok {
++					ids = append(ids, id)
++				}
++			}
++			return ids
+ 		}
+ 	}
+ 
+diff --git a/internal/golang/definition.go b/internal/golang/definition.go
+index f28fa9b28..a41507a5c 100644
+--- a/internal/golang/definition.go
++++ b/internal/golang/definition.go
+@@ -405,7 +405,7 @@ func ObjectLocation(ctx context.Context, fset *token.FileSet, snapshot *cache.Sn
+ 	//
+ 	// But this is just a heuristic, and it's wrong in this case:
+ 	// 	import ‸ast "go/ast"  	// name matches (spurious result is `ast "go/`)
+-	nameLen := len(obj.Name())
++	nameLen := len(sourceName(obj))
+ 	if pkgName, ok := obj.(*types.PkgName); ok && pkgName.Imported().Name() == pkgName.Name() {
+ 		nameLen = len(pkgName.Imported().Path()) + len(`""`)
+ 	}
+diff --git a/internal/golang/extract.go b/internal/golang/extract.go
+index d7d181289..dfeed6e47 100644
+--- a/internal/golang/extract.go
++++ b/internal/golang/extract.go
+@@ -1423,7 +1423,31 @@ func collectFreeVars(info *types.Info, file *ast.File, start, end token.Pos, nod
+ 					break
+ 				}
+ 			}
+-			return false
++		case *ast.TryStmt:
++			for _, assignment := range n.Lhs {
++				lhs, ok := assignment.(*ast.Ident)
++				if !ok {
++					continue
++				}
++				obj, _ := id(lhs)
++				if obj == nil || seen[obj] == nil {
++					continue
++				}
++				seen[obj].assigned = true
++				if firstUseIn[obj] != lhs.Pos() {
++					continue
++				}
++				for _, expr := range n.Rhs {
++					if referencesObj(info, expr, obj) {
++						continue
++					}
++					if _, ok := seen[obj]; !ok {
++						continue
++					}
++					seen[obj].defined = true
++					break
++				}
++			}
+ 		case *ast.DeclStmt:
+ 			gen, ok := n.Decl.(*ast.GenDecl)
+ 			if !ok {
+diff --git a/internal/golang/highlight.go b/internal/golang/highlight.go
+index 6c46bf1a3..78cc80b6c 100644
+--- a/internal/golang/highlight.go
++++ b/internal/golang/highlight.go
+@@ -654,6 +654,10 @@ func highlightIdentifier(cur inspector.Cursor, info *types.Info, result map[astu
+ 			for _, s := range n.Lhs {
+ 				highlightWriteInExpr(s)
+ 			}
++		case *ast.TryStmt:
++			for _, s := range n.Lhs {
++				highlightWriteInExpr(s)
++			}
+ 		case *ast.GenDecl:
+ 			if n.Tok == token.CONST || n.Tok == token.VAR {
+ 				for _, spec := range n.Specs {
+diff --git a/internal/golang/hover.go b/internal/golang/hover.go
+index 60b7b69e0..367797afa 100644
+--- a/internal/golang/hover.go
++++ b/internal/golang/hover.go
+@@ -405,7 +405,7 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
+ 	decl, spec, field, assign := findDeclInfo([]*ast.File{declPGF.File}, declPos) // may be nil^4
+ 
+ 	var docText string
+-	if docComment := chooseDocComment(declPGF, decl, spec, field, assign); docComment != nil {
++	if docComment := chooseDocComment(declPGF, declPos, obj.Name(), decl, spec, field, assign); docComment != nil {
+ 		docBuf := new(strings.Builder)
+ 		docBuf.WriteString(docComment.Text())
+ 
+@@ -617,14 +617,16 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
+ 		// already been displayed when the node was formatted
+ 		// above. Don't list these again.
+ 		var skip map[string]bool
+-		if iface, ok := spec1.Type.(*ast.InterfaceType); ok {
+-			if iface.Methods.List != nil {
+-				for _, m := range iface.Methods.List {
+-					if len(m.Names) == 1 {
+-						if skip == nil {
+-							skip = make(map[string]bool)
++		if spec1 != nil {
++			if iface, ok := spec1.Type.(*ast.InterfaceType); ok {
++				if iface.Methods.List != nil {
++					for _, m := range iface.Methods.List {
++						if len(m.Names) == 1 {
++							if skip == nil {
++								skip = make(map[string]bool)
++							}
++							skip[m.Names[0].Name] = true
+ 						}
+-						skip[m.Names[0].Name] = true
+ 					}
+ 				}
+ 			}
+@@ -636,6 +638,9 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
+ 		// embedded interfaces.
+ 		var b strings.Builder
+ 		for _, m := range typeutil.IntuitiveMethodSet(obj.Type(), nil) {
++			if strings.HasPrefix(m.Obj().Name(), ".enum.") {
++				continue // compiler-generated enum marker
++			}
+ 			if !accessibleTo(m.Obj(), pkg.Types()) {
+ 				continue // inaccessible
+ 			}
+@@ -803,10 +808,45 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
+ 
+ // typeDeclContent returns a well formatted type definition.
+ func typeDeclContent(declPGF *parsego.File, declPos token.Pos, name string) (string, *ast.TypeSpec, error) {
+-	_, spec, _, _ := findDeclInfo([]*ast.File{declPGF.File}, declPos) // may be nil^4
++	decl, spec, _, _ := findDeclInfo([]*ast.File{declPGF.File}, declPos) // may be nil^4
+ 	// Don't duplicate comments.
+-	spec1, ok := spec.(*ast.TypeSpec)
+-	if !ok {
++	if spec1, ok := spec.(*ast.TypeSpec); ok {
++		spec2 := *spec1
++		spec2.Doc = nil
++		spec2.Comment = nil
++
++		var b strings.Builder
++		b.WriteString("type ")
++		fset := tokeninternal.FileSetFor(declPGF.Tok)
++		// TODO(adonovan): use a smarter formatter that omits
++		// inaccessible fields (non-exported ones from other packages).
++		if err := format.Node(&b, fset, &spec2); err != nil {
++			return "", nil, err
++		}
++		return b.String(), spec1, nil
++	}
++	if enumDecl, ok := decl.(*ast.EnumDecl); ok {
++		variantName, isVariant := strings.CutPrefix(name, enumDecl.Name.Name+".")
++		decl2 := *enumDecl
++		decl2.Doc = nil
++		decl2.Variants = make([]*ast.EnumVariant, 0, len(enumDecl.Variants))
++		for _, variant := range enumDecl.Variants {
++			if isVariant && variant.Name.Name != variantName {
++				continue
++			}
++			variant2 := *variant
++			variant2.Doc = nil
++			variant2.Comment = nil
++			decl2.Variants = append(decl2.Variants, &variant2)
++		}
++		var b strings.Builder
++		fset := tokeninternal.FileSetFor(declPGF.Tok)
++		if err := format.Node(&b, fset, &decl2); err != nil {
++			return "", nil, err
++		}
++		return b.String(), nil, nil
++	}
++	{
+ 		// We cannot find a TypeSpec for this type or alias declaration
+ 		// (that is not a type parameter or a built-in).
+ 		// This should be impossible even for ill-formed trees;
+@@ -818,20 +858,6 @@ func typeDeclContent(declPGF *parsego.File, declPos token.Pos, name string) (str
+ 		}
+ 		return "", nil, errorf("type name %q without type spec", name)
+ 	}
+-	spec2 := *spec1
+-	spec2.Doc = nil
+-	spec2.Comment = nil
+-
+-	var b strings.Builder
+-	b.WriteString("type ")
+-	fset := tokeninternal.FileSetFor(declPGF.Tok)
+-	// TODO(adonovan): use a smarter formatter that omits
+-	// inaccessible fields (non-exported ones from other packages).
+-	if err := format.Node(&b, fset, &spec2); err != nil {
+-		return "", nil, err
+-	}
+-	typeDecl := b.String()
+-	return typeDecl, spec1, nil
+ }
+ 
+ // hoverBuiltin computes hover information when hovering over a builtin
+@@ -1359,12 +1385,12 @@ func HoverDocForObject(ctx context.Context, snapshot *cache.Snapshot, fset *toke
+ 	}
+ 
+ 	decl, spec, field, assign := findDeclInfo([]*ast.File{pgf.File}, pos)
+-	return chooseDocComment(pgf, decl, spec, field, assign), nil
++	return chooseDocComment(pgf, pos, obj.Name(), decl, spec, field, assign), nil
+ }
+ 
+ // chooseDocComment returns the best doc comment for the given declaration
+ // information.
+-func chooseDocComment(pgf *parsego.File, decl ast.Decl, spec ast.Spec, field *ast.Field, assign *ast.AssignStmt) *ast.CommentGroup {
++func chooseDocComment(pgf *parsego.File, pos token.Pos, name string, decl ast.Decl, spec ast.Spec, field *ast.Field, assign *ast.AssignStmt) *ast.CommentGroup {
+ 	if assign != nil {
+ 		// AssignStmt lacks a Doc field; locate the comment on the line above.
+ 		tokFile := pgf.Tok
+@@ -1395,6 +1421,29 @@ func chooseDocComment(pgf *parsego.File, decl ast.Decl, spec ast.Spec, field *as
+ 	switch decl := decl.(type) {
+ 	case *ast.FuncDecl:
+ 		return decl.Doc
++	case *ast.EnumDecl:
++		// NarrowestDeclaringPackage may return the parent enum's position for
++		// a variant type, so prefer the object name when selecting documentation.
++		if name == decl.Name.Name {
++			return decl.Doc
++		}
++		if variantName, ok := strings.CutPrefix(name, decl.Name.Name+"."); ok {
++			for _, variant := range decl.Variants {
++				if variantName != variant.Name.Name {
++					continue
++				}
++				if variant.Doc != nil {
++					return variant.Doc
++				}
++				if variant.Comment != nil {
++					return variant.Comment
++				}
++				return decl.Doc
++			}
++		}
++		if decl.Name.Pos() == pos {
++			return decl.Doc
++		}
+ 	case *ast.GenDecl:
+ 		switch spec := spec.(type) {
+ 		case *ast.ValueSpec:
+@@ -1770,6 +1819,20 @@ func findDeclInfo(files []*ast.File, pos token.Pos) (decl ast.Decl, spec ast.Spe
+ 				return false
+ 			}
+ 
++		case *ast.EnumDecl:
++			if n.Name.Pos() == pos {
++				decl = n
++				found = true
++				return false
++			}
++			for _, variant := range n.Variants {
++				if variant.Name.Pos() == pos {
++					decl = n
++					found = true
++					return false
++				}
++			}
++
+ 		case *ast.GenDecl:
+ 			for _, s := range n.Specs {
+ 				switch s := s.(type) {
+diff --git a/internal/golang/inlay_hint.go b/internal/golang/inlay_hint.go
+index 9e23e76fc..c596cbebf 100644
+--- a/internal/golang/inlay_hint.go
++++ b/internal/golang/inlay_hint.go
+@@ -227,7 +227,7 @@ func funcTypeParams(info *types.Info, pgf *parsego.File, qual types.Qualifier, c
+ }
+ 
+ func assignVariableTypes(info *types.Info, pgf *parsego.File, qual types.Qualifier, cur inspector.Cursor, add func(protocol.InlayHint)) {
+-	for node := range cur.Preorder((*ast.AssignStmt)(nil), (*ast.ValueSpec)(nil)) {
++	for node := range cur.Preorder((*ast.AssignStmt)(nil), (*ast.TryStmt)(nil), (*ast.ValueSpec)(nil)) {
+ 		switch n := node.Node().(type) {
+ 		case *ast.AssignStmt:
+ 			if n.Tok != token.DEFINE {
+@@ -236,6 +236,10 @@ func assignVariableTypes(info *types.Info, pgf *parsego.File, qual types.Qualifi
+ 			for _, v := range n.Lhs {
+ 				variableType(info, pgf, qual, v, add)
+ 			}
++		case *ast.TryStmt:
++			for _, v := range n.Lhs {
++				variableType(info, pgf, qual, v, add)
++			}
+ 		case *ast.GenDecl:
+ 			if n.Tok != token.VAR {
+ 				continue
+diff --git a/internal/golang/rename.go b/internal/golang/rename.go
+index 9e04f8dff..bdc0864cb 100644
+--- a/internal/golang/rename.go
++++ b/internal/golang/rename.go
+@@ -89,6 +89,7 @@ type renamer struct {
+ 	objsToUpdate       map[types.Object]bool // records progress of calls to check
+ 	conflicts          []string
+ 	from, to           string
++	toLookup           string
+ 	satisfyConstraints map[satisfy.Constraint]bool
+ 	msets              typeutil.MethodSetCache
+ 	changeMethods      bool
+@@ -180,7 +181,7 @@ func PrepareRename(ctx context.Context, snapshot *cache.Snapshot, f file.Handle,
+ 	}
+ 	return &PrepareItem{
+ 		Range: nodeRng,
+-		Text:  obj.Name(),
++		Text:  sourceName(obj),
+ 	}, nil, nil
+ }
+ 
+@@ -614,7 +615,7 @@ func renameOrdinary(ctx context.Context, snapshot *cache.Snapshot, uri protocol.
+ 	// Pick a representative object arbitrarily.
+ 	// (All share the same name, pos, and kind.)
+ 	obj, node := targets[0].obj, targets[0].cur.Node()
+-	if obj.Name() == newName {
++	if sourceName(obj) == newName {
+ 		return nil, fmt.Errorf("old and new names are the same: %s", newName)
+ 	}
+ 	if err := checkRenamable(obj, node); err != nil {
+@@ -636,6 +637,19 @@ func renameOrdinary(ctx context.Context, snapshot *cache.Snapshot, uri protocol.
+ 		}
+ 	}
+ 
++	// Enum variants have qualified package-scope object names such as
++	// Result.Ok. objectpath.Path uses dots as traversal operators, so it cannot
++	// represent such a name as a package-scope lookup. Find the corresponding
++	// variant directly in each reverse dependency instead.
++	if sourceName(obj) != obj.Name() {
++		declURI := protocol.URIFromPath(pkg.FileSet().File(obj.Pos()).Name())
++		pkgs, err := typeCheckReverseDependencies(ctx, snapshot, declURI, true)
++		if err != nil {
++			return nil, err
++		}
++		return renameEnumVariant(pkgs, PackagePath(obj.Pkg().Path()), obj.Name(), newName)
++	}
++
+ 	// Find objectpath, if object is exported ("" otherwise).
+ 	var declObjPath objectpath.Path
+ 	if obj.Exported() {
+@@ -771,6 +785,43 @@ func renameOrdinary(ctx context.Context, snapshot *cache.Snapshot, uri protocol.
+ 	return renameExported(pkgs, declPkgPath, declObjPath, newName)
+ }
+ 
++// renameEnumVariant renames a variant whose qualified package-scope name
++// cannot be represented by objectpath.Path.
++func renameEnumVariant(pkgs []*cache.Package, declPkgPath PackagePath, qualifiedName, newName string) (map[protocol.DocumentURI][]diff.Edit, error) {
++	allEdits := make(map[protocol.DocumentURI][]diff.Edit)
++	for _, pkg := range pkgs {
++		declPkg := pkg.DependencyTypes(declPkgPath)
++		if declPkg == nil {
++			continue
++		}
++		obj := declPkg.Scope().Lookup(qualifiedName)
++		if obj == nil {
++			continue
++		}
++		enumName, _, ok := strings.Cut(qualifiedName, ".")
++		if !ok {
++			return nil, bug.Errorf("invalid qualified enum variant name %q", qualifiedName)
++		}
++		if enumObj, ok := declPkg.Scope().Lookup(enumName).(*types.TypeName); ok {
++			if named, ok := types.Unalias(enumObj.Type()).(*types.Named); ok {
++				for method := range named.Methods() {
++					if method.Name() == newName {
++						return nil, fmt.Errorf("renaming enum variant %q to %q would conflict with method %s.%s", sourceName(obj), newName, enumName, newName)
++					}
++				}
++			}
++		}
++		editMap, _, err := renameObjects(newName, pkg, obj)
++		if err != nil {
++			return nil, err
++		}
++		for uri, edits := range editMap {
++			allEdits[uri] = append(allEdits[uri], edits...)
++		}
++	}
++	return allEdits, nil
++}
++
+ // renameReceivers renames all receivers of methods of the same named
+ // type as recv. The edits of each successful renaming are added to
+ // editMap; the failed ones are quietly discarded.
+@@ -1334,11 +1385,16 @@ func renameImports(ctx context.Context, snapshot *cache.Snapshot, mp *metadata.P
+ //
+ // It returns an error if the renaming would cause a conflict.
+ func renameObjects(newName string, pkg *cache.Package, targets ...types.Object) (map[protocol.DocumentURI][]diff.Edit, map[types.Object]bool, error) {
++	toLookup := newName
++	if source := sourceName(targets[0]); source != targets[0].Name() {
++		toLookup = strings.TrimSuffix(targets[0].Name(), source) + newName
++	}
+ 	r := renamer{
+ 		pkg:          pkg,
+ 		objsToUpdate: make(map[types.Object]bool),
+-		from:         targets[0].Name(),
++		from:         sourceName(targets[0]),
+ 		to:           newName,
++		toLookup:     toLookup,
+ 	}
+ 
+ 	// A renaming initiated at an interface method indicates the
+@@ -1689,6 +1745,13 @@ func (r *docLinkRenamer) update(pgf *parsego.File) (result []diff.Edit, err erro
+ 			doc = decl.Doc
+ 		case *ast.FuncDecl:
+ 			doc = decl.Doc
++		case *ast.EnumDecl:
++			doc = decl.Doc
++			for _, variant := range decl.Variants {
++				if err := updateDocLinks(variant.Doc); err != nil {
++					return nil, err
++				}
++			}
+ 		}
+ 		err = updateDocLinks(doc)
+ 		if err != nil {
+@@ -1708,6 +1771,13 @@ func docComment(pgf *parsego.File, curId inspector.Cursor) *ast.CommentGroup {
+ 			return decl.Doc
+ 		case *ast.Field:
+ 			return decl.Doc
++		case *ast.EnumVariant:
++			if decl.Doc != nil {
++				return decl.Doc
++			}
++			return decl.Comment
++		case *ast.EnumDecl:
++			return decl.Doc
+ 		case *ast.GenDecl:
+ 			return decl.Doc
+ 		// For {Type,Value}Spec, if the doc on the spec is absent,
+diff --git a/internal/golang/rename_check.go b/internal/golang/rename_check.go
+index 3c67d5416..8c972df72 100644
+--- a/internal/golang/rename_check.go
++++ b/internal/golang/rename_check.go
+@@ -130,7 +130,7 @@ func (r *renamer) checkInFileBlock(from *types.PkgName) {
+ 	}
+ 
+ 	// Check for conflicts between file and package block.
+-	if prev := from.Pkg().Scope().Lookup(r.to); prev != nil {
++	if prev := from.Pkg().Scope().Lookup(r.toLookup); prev != nil {
+ 		r.errorf(from.Pos(), "renaming this %s %q to %q would conflict",
+ 			objectKind(from), from.Name(), r.to)
+ 		r.errorf(prev.Pos(), "\twith this package member %s",
+@@ -181,7 +181,7 @@ func (r *renamer) checkInPackageBlock(from types.Object) {
+ 			if fileScope == nil {
+ 				continue // type error? (golang/go#40835)
+ 			}
+-			b, prev := fileScope.LookupParent(r.to, token.NoPos)
++			b, prev := fileScope.LookupParent(r.toLookup, token.NoPos)
+ 			if b == fileScope {
+ 				r.errorf(from.Pos(), "renaming this %s %q to %q would conflict", objectKind(from), from.Name(), r.to)
+ 				r.errorf(prev.Pos(), "\twith this %s", objectKind(prev))
+@@ -229,7 +229,7 @@ func (r *renamer) checkInPackageBlock(from types.Object) {
+ func (r *renamer) checkInLexicalScope(from types.Object) {
+ 	b := from.Parent() // the block defining the 'from' object
+ 	if b != nil {
+-		toBlock, to := b.LookupParent(r.to, from.Parent().End())
++		toBlock, to := b.LookupParent(r.toLookup, from.Parent().End())
+ 		if toBlock == b {
+ 			// same-block conflict
+ 			r.errorf(from.Pos(), "renaming this %s %q to %q",
+@@ -264,7 +264,7 @@ func (r *renamer) checkInLexicalScope(from types.Object) {
+ 		// It may be an ancestor.
+ 		fromBlock, _ := block.LookupParent(from.Name(), id.Pos())
+ 		// See what r.to would resolve to in the same scope.
+-		toBlock, to := block.LookupParent(r.to, id.Pos())
++		toBlock, to := block.LookupParent(r.toLookup, id.Pos())
+ 		if to != nil {
+ 			// sub-block conflict
+ 			if deeper(toBlock, fromBlock) {
+diff --git a/internal/golang/semtok.go b/internal/golang/semtok.go
+index 4d0a835ca..7d386c20f 100644
+--- a/internal/golang/semtok.go
++++ b/internal/golang/semtok.go
+@@ -379,6 +379,9 @@ func (tv *tokenVisitor) inspect(n ast.Node) (descend bool) {
+ 	case *ast.ArrayType:
+ 	case *ast.AssignStmt:
+ 		tv.token(n.TokPos, len(n.Tok.String()), semtok.TokOperator)
++	case *ast.TryStmt:
++		tv.token(n.Try, len("try"), semtok.TokKeyword)
++		if n.TokPos.IsValid() { tv.token(n.TokPos, len(":="), semtok.TokOperator) }
+ 	case *ast.BasicLit:
+ 		if n.Kind == token.STRING {
+ 			if strings.Contains(n.Value, "\n") {
+@@ -432,6 +435,10 @@ func (tv *tokenVisitor) inspect(n ast.Node) (descend bool) {
+ 	case *ast.Ellipsis:
+ 		tv.token(n.Ellipsis, len("..."), semtok.TokOperator)
+ 	case *ast.EmptyStmt:
++	case *ast.EnumDecl:
++		tv.token(n.Type, len("type"), semtok.TokKeyword)
++		tv.token(n.Enum, len("enum"), semtok.TokKeyword)
++	case *ast.EnumVariant:
+ 	case *ast.ExprStmt:
+ 	case *ast.Field:
+ 	case *ast.FieldList:
+@@ -831,11 +837,22 @@ func (tv *tokenVisitor) unkIdent(id *ast.Ident) (semtok.Type, []semtok.Modifier)
+ 		}
+ 		// RHS, = x
+ 		return semtok.TokVariable, nil
++	case *ast.TryStmt:
++		for _, p := range parent.Lhs {
++			if p == id {
++				return semtok.TokVariable, def
++			}
++		}
++		return semtok.TokVariable, nil
+ 	case *ast.TypeSpec: // it's a type if it is either the Name or the Type
+ 		if id == parent.Type {
+ 			def = nil
+ 		}
+ 		return semtok.TokType, def
++	case *ast.EnumDecl:
++		return semtok.TokType, def
++	case *ast.EnumVariant:
++		return semtok.TokType, def
+ 	case *ast.Field:
+ 		// ident could be type in a field, or a method in an interface type, or a variable
+ 		if id == parent.Type {
+diff --git a/internal/golang/symbols.go b/internal/golang/symbols.go
+index f41b56cd6..547bc02ed 100644
+--- a/internal/golang/symbols.go
++++ b/internal/golang/symbols.go
+@@ -71,6 +71,11 @@ func DocumentSymbols(ctx context.Context, snapshot *cache.Snapshot, fh file.Hand
+ 					}
+ 				}
+ 			}
++		case *ast.EnumDecl:
++			es, err := enumSymbol(pgf.Mapper, pgf.Tok, decl)
++			if err == nil {
++				symbols = append(symbols, es)
++			}
+ 		}
+ 	}
+ 	return symbols, nil
+@@ -155,6 +160,11 @@ func PackageSymbols(ctx context.Context, snapshot *cache.Snapshot, uri protocol.
+ 						}
+ 					}
+ 				}
++			case *ast.EnumDecl:
++				if es, err := enumSymbol(pgf.Mapper, pgf.Tok, decl); err == nil {
++					typeSymbolToIdx[es.Name] = len(symbols)
++					symbols = append(symbols, toPackageSymbol(fidx, es))
++				}
+ 			}
+ 		}
+ 	}
+@@ -228,6 +238,41 @@ func typeSymbol(m *protocol.Mapper, tf *token.File, spec *ast.TypeSpec) (protoco
+ 	return s, nil
+ }
+ 
++func enumSymbol(m *protocol.Mapper, tf *token.File, decl *ast.EnumDecl) (protocol.DocumentSymbol, error) {
++	s := protocol.DocumentSymbol{
++		Name:   decl.Name.Name,
++		Kind:   protocol.Enum,
++		Detail: "enum",
++	}
++	var err error
++	s.Range, err = m.NodeRange(tf, decl)
++	if err != nil {
++		return protocol.DocumentSymbol{}, err
++	}
++	s.SelectionRange, err = m.NodeRange(tf, decl.Name)
++	if err != nil {
++		return protocol.DocumentSymbol{}, err
++	}
++	for _, variant := range decl.Variants {
++		child := protocol.DocumentSymbol{
++			Name: variant.Name.Name,
++			Kind: protocol.EnumMember,
++		}
++		if variant.Fields != nil {
++			child.Detail = "struct{...}"
++			child.Children = fieldListSymbols(m, tf, variant.Fields, protocol.Field)
++		}
++		if rng, err := m.NodeRange(tf, variant); err == nil {
++			child.Range = rng
++		}
++		if rng, err := m.NodeRange(tf, variant.Name); err == nil {
++			child.SelectionRange = rng
++		}
++		s.Children = append(s.Children, child)
++	}
++	return s, nil
++}
++
+ func typeDetails(m *protocol.Mapper, tf *token.File, typExpr ast.Expr) (kind protocol.SymbolKind, detail string, children []protocol.DocumentSymbol) {
+ 	switch typExpr := typExpr.(type) {
+ 	case *ast.StructType:
+diff --git a/internal/golang/util.go b/internal/golang/util.go
+index a25cf463d..f9d200d77 100644
+--- a/internal/golang/util.go
++++ b/internal/golang/util.go
+@@ -23,6 +23,26 @@ import (
+ 	"golang.org/x/tools/gopls/internal/util/tokeninternal"
+ )
+ 
++// sourceName returns the identifier spelling used at an object's declaration.
++// Enum variant type objects have a qualified package-local name (Result.Ok),
++// while their declaring identifier is only the final component (Ok).
++func sourceName(obj types.Object) string {
++	name := obj.Name()
++	tname, _ := obj.(*types.TypeName)
++	if tname == nil {
++		return name
++	}
++	named, _ := types.Unalias(tname.Type()).(*types.Named)
++	if named != nil {
++		if enumType := named.EnumType(); enumType != nil && enumType.Origin() != named.Origin() {
++			if i := strings.LastIndexByte(name, '.'); i >= 0 {
++				return name[i+1:]
++			}
++		}
++	}
++	return name
++}
++
+ // IsGenerated reads and parses the header of the file denoted by uri
+ // and reports whether it [ast.IsGenerated].
+ func IsGenerated(ctx context.Context, snapshot *cache.Snapshot, uri protocol.DocumentURI) bool {
+diff --git a/internal/settings/settings.go b/internal/settings/settings.go
+index 52c7786bf..78a97d336 100644
+--- a/internal/settings/settings.go
++++ b/internal/settings/settings.go
+@@ -1706,12 +1706,12 @@ func asStringSlice(value any) ([]string, error) {
+ }
+ 
+ func setEnum[S ~string](dest *S, value any, options ...S) ([]CounterPath, error) {
+-	enum, err := asEnum(value, options...)
++	choice, err := asEnum(value, options...)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	*dest = enum
+-	return []CounterPath{{string(enum)}}, nil
++	*dest = choice
++	return []CounterPath{{string(choice)}}, nil
+ }
+ 
+ func asEnum[S ~string](value any, options ...S) (S, error) {
+diff --git a/internal/test/integration/completion/enum_test.go b/internal/test/integration/completion/enum_test.go
+new file mode 100644
+index 000000000..9314bf0a2
+--- /dev/null
++++ b/internal/test/integration/completion/enum_test.go
+@@ -0,0 +1,88 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package completion
++
++import (
++	"slices"
++	"testing"
++
++	"golang.org/x/tools/gopls/internal/protocol"
++	. "golang.org/x/tools/gopls/internal/test/integration"
++)
++
++func TestEnumSwitchNarrowingCompletion(t *testing.T) {
++	const files = `
++-- go.mod --
++module example.com
++
++go 1.28
++-- enum.go --
++package example
++
++type Result enum {
++	Ok { Value int }
++	Err { Message string }
++}
++
++func use(r Result) {
++	switch r {
++	case Ok:
++		r.
++	case Err:
++		r.
++	case nil:
++	}
++}
++`
++
++	WithOptions(Modes(Default)).Run(t, files, func(t *testing.T, env *Env) {
++		env.OpenFile("enum.go")
++		ok := env.Completion(env.RegexpSearch("enum.go", `case Ok:\n\t\tr\.()`))
++		okLabels := completionLabels(ok.Items)
++		if !slices.Contains(okLabels, "Value") || slices.Contains(okLabels, "Message") || slices.Contains(okLabels, ".enum.Result") {
++			t.Errorf("Ok completion labels: %v", okLabels)
++		}
++		err := env.Completion(env.RegexpSearch("enum.go", `case Err:\n\t\tr\.()`))
++		errLabels := completionLabels(err.Items)
++		if !slices.Contains(errLabels, "Message") || slices.Contains(errLabels, "Value") || slices.Contains(errLabels, ".enum.Result") {
++			t.Errorf("Err completion labels: %v", errLabels)
++		}
++	})
++}
++
++func TestEnumVariantCompletion(t *testing.T) {
++	const files = `
++-- go.mod --
++module example.com
++
++go 1.28
++-- enum.go --
++package example
++
++type Result enum {
++	Ok { Value int }
++	Err { Message string }
++}
++
++var _ = Result.
++`
++
++	WithOptions(Modes(Default)).Run(t, files, func(t *testing.T, env *Env) {
++		env.OpenFile("enum.go")
++		items := env.Completion(env.RegexpSearch("enum.go", `Result\.()`))
++		labels := completionLabels(items.Items)
++		if !slices.Contains(labels, "Ok") || !slices.Contains(labels, "Err") || slices.Contains(labels, "Result.Ok") {
++			t.Errorf("Result completion labels: %v", labels)
++		}
++	})
++}
++
++func completionLabels(items []protocol.CompletionItem) []string {
++	labels := make([]string, len(items))
++	for i, item := range items {
++		labels[i] = item.Label
++	}
++	return labels
++}
+diff --git a/internal/test/integration/misc/hover_test.go b/internal/test/integration/misc/hover_test.go
+index b2e9af7b9..1b4443182 100644
+--- a/internal/test/integration/misc/hover_test.go
++++ b/internal/test/integration/misc/hover_test.go
+@@ -424,6 +424,106 @@ func Hello() string {
+ 	})
+ }
+ 
++func TestEnumTooling(t *testing.T) {
++	const source = `
++-- go.mod --
++module example.com/p
++
++go 1.28
++-- enum.go --
++package p
++
++// Result reports success or failure.
++type Result enum {
++	// Ok carries a value.
++	Ok { Value int }
++	Err { Message string }
++}
++
++// Same parent documentation.
++type Same enum {
++	// Same variant documentation.
++	Same
++}
++
++var Success int
++
++func (result Result) Or(fallback int) int {
++	switch result {
++	case Ok:
++		return result.Value
++	case Err, nil:
++		return fallback
++	}
++	return fallback
++}
++
++func use(result Result) int {
++	return result.Or(1)
++}
++
++func qualified() Result {
++	return Result.Ok{Value: 1}
++}
++-- client/client.go --
++package client
++
++import "example.com/p"
++
++var _ p.Result = p.Result.Ok{Value: 2}
++`
++	WithOptions(Modes(Default)).Run(t, source, func(t *testing.T, env *Env) {
++		env.OpenFile("enum.go")
++		env.OpenFile("client/client.go")
++
++		parent, _ := env.Hover(env.RegexpSearch("enum.go", `type (Result) enum`))
++		if !strings.Contains(parent.Value, "type Result enum") || !strings.Contains(parent.Value, "Result reports success") {
++			t.Errorf("Result hover = %q", parent.Value)
++		}
++
++		variant, _ := env.Hover(env.RegexpSearch("enum.go", `\t(Ok) \{`))
++		if !strings.Contains(variant.Value, "type Result enum") || !strings.Contains(variant.Value, "Ok carries a value") || strings.Contains(variant.Value, ".enum.Result") {
++			t.Errorf("Ok hover = %q", variant.Value)
++		}
++
++		sameParent, _ := env.Hover(env.RegexpSearch("enum.go", `type (Same) enum`))
++		if !strings.Contains(sameParent.Value, "Same parent documentation") {
++			t.Errorf("Same parent hover = %q", sameParent.Value)
++		}
++		sameVariant, _ := env.Hover(env.RegexpSearch("enum.go", `\t(Same)\n`))
++		if !strings.Contains(sameVariant.Value, "Same variant documentation") || strings.Contains(sameVariant.Value, "Same parent documentation") {
++			t.Errorf("Same variant hover = %q", sameVariant.Value)
++		}
++
++		signatures := env.SignatureHelp(env.RegexpSearch("enum.go", `result\.Or\(()1`))
++		if len(signatures.Signatures) != 1 || signatures.Signatures[0].Label != "Or(fallback int) int" {
++			t.Errorf("Or signatures = %#v", signatures.Signatures)
++		}
++
++		use := env.RegexpSearch("enum.go", `Result\.(Ok)\{`)
++		decl := env.RegexpSearch("enum.go", `\t(Ok) \{`)
++		if diff := cmp.Diff(decl, env.FirstDefinition(use)); diff != "" {
++			t.Errorf("Ok definition mismatch (-want +got):\n%s", diff)
++		}
++		for _, conflict := range []string{"Err", "Or"} {
++			if err := env.Editor.Rename(env.Ctx, use, conflict); err == nil {
++				t.Errorf("renaming Ok to conflicting name %q succeeded", conflict)
++			}
++		}
++
++		env.Rename(use, "Success")
++		text := env.BufferText("enum.go")
++		for _, want := range []string{"Success { Value int }", "case Success:", "Result.Success{Value: 1}"} {
++			if !strings.Contains(text, want) {
++				t.Errorf("renamed enum is missing %q:\n%s", want, text)
++			}
++		}
++		if text := env.BufferText("client/client.go"); !strings.Contains(text, "p.Result.Success{Value: 2}") {
++			t.Errorf("renamed imported enum variant is missing from client:\n%s", text)
++		}
++	})
++}
++
+ // Test that the generated markdown contains links for Go references.
+ // https://github.com/golang/go/issues/58352
+ func TestHoverLinks(t *testing.T) {
