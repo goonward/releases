@@ -1,5 +1,5 @@
 // Command goplus-install downloads, verifies, and installs a precompiled Go+
-// release on Linux.
+// release on Linux and macOS.
 package main
 
 import (
@@ -131,10 +131,12 @@ func fetchRelease(ctx context.Context, asset string) (string, error) {
 }
 
 func assetName(goos, goarch string) (string, error) {
-	if goos != "linux" || goarch != "amd64" {
+	supported := goos == "linux" && goarch == "amd64" ||
+		goos == "darwin" && (goarch == "amd64" || goarch == "arm64")
+	if !supported {
 		return "", fmt.Errorf("unsupported platform %s/%s", goos, goarch)
 	}
-	return "goplus-linux-amd64.tar.gz", nil
+	return fmt.Sprintf("goplus-%s-%s.tar.gz", goos, goarch), nil
 }
 
 func download(ctx context.Context, client *http.Client, sourceURL, destination string) (resultErr error) {

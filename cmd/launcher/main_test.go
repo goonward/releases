@@ -14,18 +14,25 @@ import (
 func TestTargetFor(t *testing.T) {
 	tests := []struct {
 		name string
+		goos string
 		want []string
 	}{
-		{"go+", []string{"go", "bin", "go.exe"}},
-		{"gofmt+", []string{"go", "bin", "gofmt.exe"}},
-		{"gopls+", []string{"libexec", "gopls.exe"}},
-		{"goimports+", []string{"libexec", "goimports.exe"}},
+		{name: "go+", goos: "windows", want: []string{"go", "bin", "go.exe"}},
+		{name: "gofmt+", goos: "windows", want: []string{"go", "bin", "gofmt.exe"}},
+		{name: "gopls+", goos: "windows", want: []string{"libexec", "gopls.exe"}},
+		{name: "goimports+", goos: "windows", want: []string{"libexec", "goimports.exe"}},
+		{name: "go+", goos: "darwin", want: []string{"go", "bin", "go"}},
+		{name: "gofmt+", goos: "darwin", want: []string{"go", "bin", "gofmt"}},
+		{name: "gopls+", goos: "darwin", want: []string{"libexec", "gopls"}},
+		{name: "goimports+", goos: "darwin", want: []string{"libexec", "goimports"}},
 	}
 	for _, test := range tests {
-		got, ok := targetFor(test.name, "windows")
-		if !ok || !slices.Equal(got, test.want) {
-			t.Errorf("targetFor(%q) = %v, %v; want %v, true", test.name, got, ok, test.want)
-		}
+		t.Run(test.goos+"/"+test.name, func(t *testing.T) {
+			got, ok := targetFor(test.name, test.goos)
+			if !ok || !slices.Equal(got, test.want) {
+				t.Errorf("targetFor(%q, %q) = %v, %v; want %v, true", test.name, test.goos, got, ok, test.want)
+			}
+		})
 	}
 	if _, ok := targetFor("unknown", "windows"); ok {
 		t.Error("targetFor(unknown) succeeded")

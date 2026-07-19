@@ -2,51 +2,75 @@ name: Build release
 
 on:
   pull_request:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: Release version used in the installers
-        required: false
-        default: v0.0.0-dev.0
-      goplus_ref:
-        description: goonward/goplus commit or ref
-        required: false
+        description: Version to publish, such as v0.1.0-alpha.1
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   versions:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
+      version: ${{ steps.read.outputs.version }}
       goplus_ref: ${{ steps.read.outputs.goplus_ref }}
       tools_ref: ${{ steps.read.outputs.tools_ref }}
       gopls_ref: ${{ steps.read.outputs.gopls_ref }}
     steps:
       - uses: actions/checkout@v7
+
       - id: read
+        name: Validate and read versions
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DISPATCH_REF: ${{ github.ref }}
+          REQUESTED_VERSION: ${{ inputs.version }}
         shell: bash
         run: |
+          set -euo pipefail
+
+          version=v0.0.0-dev.0
+          if [[ $GITHUB_EVENT_NAME == workflow_dispatch ]]; then
+            if [[ $DISPATCH_REF != refs/heads/$DEFAULT_BRANCH ]]; then
+              echo "releases must run from the default branch: $DEFAULT_BRANCH" >&2
+              exit 1
+            fi
+            if [[ ! $REQUESTED_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] ||
+              ! git check-ref-format "refs/tags/$REQUESTED_VERSION"; then
+              echo "invalid release version: $REQUESTED_VERSION" >&2
+              exit 1
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/$REQUESTED_VERSION" >/dev/null 2>&1; then
+              echo "release tag already exists: $REQUESTED_VERSION" >&2
+              exit 1
+            fi
+            version=$REQUESTED_VERSION
+          fi
+
           source versions.env
+          : "${GOPLUS_REF:?GOPLUS_REF is required}"
+          : "${TOOLS_REF:?TOOLS_REF is required}"
+          : "${GOPLS_REF:?GOPLS_REF is required}"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "goplus_ref=$GOPLUS_REF" >> "$GITHUB_OUTPUT"
           echo "tools_ref=$TOOLS_REF" >> "$GITHUB_OUTPUT"
           echo "gopls_ref=$GOPLS_REF" >> "$GITHUB_OUTPUT"
 
   linux:
     needs: versions
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
-
-      - uses: actions/checkout@v7
-        with:
-          repository: goonward/goplus
-          ref: ${{ inputs.goplus_ref || needs.versions.outputs.goplus_ref }}
-          path: goplus
 
       - uses: actions/setup-go@v7
         with:
@@ -56,31 +80,31 @@ jobs:
       - name: Test release tools
         run: go test ./...
 
+      - uses: actions/checkout@v7
+        with:
+          repository: goonward/goplus
+          ref: ${{ needs.versions.outputs.goplus_ref }}
+          path: goplus
+
       - name: Build Linux release
         env:
-          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version || 'v0.0.0-dev.0' }}
+          VERSION: ${{ needs.versions.outputs.version }}
           TOOLS_REF: ${{ needs.versions.outputs.tools_ref }}
           GOPLS_REF: ${{ needs.versions.outputs.gopls_ref }}
-        run: bash scripts/build-linux.sh "$GITHUB_WORKSPACE/goplus" "$GITHUB_WORKSPACE/dist" "$VERSION" "$TOOLS_REF" "$GOPLS_REF"
+        run: bash scripts/build-unix.sh "$GITHUB_WORKSPACE/goplus" "$GITHUB_WORKSPACE/dist" "$VERSION" "$TOOLS_REF" "$GOPLS_REF"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: linux-release
+          name: linux-amd64-release
           path: dist/*
           if-no-files-found: error
 
   windows:
     needs: versions
-    runs-on: windows-latest
-    timeout-minutes: 35
+    runs-on: windows-2025
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
-
-      - uses: actions/checkout@v7
-        with:
-          repository: goonward/goplus
-          ref: ${{ inputs.goplus_ref || needs.versions.outputs.goplus_ref }}
-          path: goplus
 
       - uses: actions/setup-go@v7
         with:
@@ -90,24 +114,77 @@ jobs:
       - name: Test release tools
         run: go test ./...
 
+      - uses: actions/checkout@v7
+        with:
+          repository: goonward/goplus
+          ref: ${{ needs.versions.outputs.goplus_ref }}
+          path: goplus
+
       - name: Build Windows release
         shell: pwsh
         env:
-          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version || 'v0.0.0-dev.0' }}
+          VERSION: ${{ needs.versions.outputs.version }}
           TOOLS_REF: ${{ needs.versions.outputs.tools_ref }}
           GOPLS_REF: ${{ needs.versions.outputs.gopls_ref }}
         run: ./scripts/build-windows.ps1 -SourceRoot "$env:GITHUB_WORKSPACE\goplus" -OutputDir "$env:GITHUB_WORKSPACE\dist" -Version $env:VERSION -ToolsRef $env:TOOLS_REF -GoplsRef $env:GOPLS_REF
 
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-release
+          name: windows-amd64-release
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    needs: versions
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: amd64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.3
+          cache: false
+
+      - name: Test release tools
+        run: go test ./...
+
+      - uses: actions/checkout@v7
+        with:
+          repository: goonward/goplus
+          ref: ${{ needs.versions.outputs.goplus_ref }}
+          path: goplus
+
+      - name: Build macOS release
+        env:
+          VERSION: ${{ needs.versions.outputs.version }}
+          TOOLS_REF: ${{ needs.versions.outputs.tools_ref }}
+          GOPLS_REF: ${{ needs.versions.outputs.gopls_ref }}
+        run: bash scripts/build-unix.sh "$GITHUB_WORKSPACE/goplus" "$GITHUB_WORKSPACE/dist" "$VERSION" "$TOOLS_REF" "$GOPLS_REF"
+
+      - name: Verify macOS architecture
+        run: |
+          test -f "dist/goplus-darwin-${{ matrix.arch }}.tar.gz"
+          test -x "dist/goplus-install-darwin-${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: darwin-${{ matrix.arch }}-release
           path: dist/*
           if-no-files-found: error
 
   publish:
-    if: github.ref_type == 'tag'
-    needs: [linux, windows]
-    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    needs: [versions, linux, windows, macos]
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -117,10 +194,106 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=(
+            goplus-linux-amd64.tar.gz
+            goplus-install-linux-amd64
+            goplus-windows-amd64.zip
+            goplus-windows-amd64.msi
+            goplus-darwin-amd64.tar.gz
+            goplus-install-darwin-amd64
+            goplus-darwin-arm64.tar.gz
+            goplus-install-darwin-arm64
+          )
+          for asset in "${assets[@]}"; do
+            test -f "dist/$asset"
+          done
+
       - name: Write checksums
         run: cd dist && sha256sum * | sort -k2 > SHA256SUMS
+
+      - id: tag
+        name: Create release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.versions.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            --field "ref=refs/tags/$VERSION" \
+            --field "sha=$GITHUB_SHA"
+
+      - id: draft
+        name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.versions.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=()
+          if [[ $VERSION == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Go+ $VERSION" \
+            --generate-notes \
+            --draft \
+            --verify-tag \
+            "${flags[@]}"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.versions.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release upload "$VERSION" dist/* --repo "$GITHUB_REPOSITORY"
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag
+          VERSION: ${{ needs.versions.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_url=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json url --jq .url)
+          echo "Published [$VERSION]($release_url)" >> "$GITHUB_STEP_SUMMARY"
+          gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
+
+      - name: Clean up failed draft
+        if: ${{ always() && steps.tag.outcome == 'success' && job.status != 'success' }}
+        env:
+          DRAFT_OUTCOME: ${{ steps.draft.outcome }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.versions.outputs.version }}
+        shell: bash
+        run: |
+          set -u
+          tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION" --jq .object.sha 2>/dev/null || true)
+          if [[ -n $tag_sha && $tag_sha != "$GITHUB_SHA" ]]; then
+            echo "release tag no longer points to this run; leaving it intact" >&2
+            exit
+          fi
+
+          if [[ $DRAFT_OUTCOME == success ]]; then
+            release_state=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)
+            if [[ $release_state == true ]]; then
+              gh release delete "$VERSION" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              exit
+            fi
+            if [[ -n $release_state ]]; then
+              echo "release is already public; leaving it and its tag intact" >&2
+              exit
+            fi
+          fi
+
+          if [[ $tag_sha == "$GITHUB_SHA" ]]; then
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$VERSION"
+          fi

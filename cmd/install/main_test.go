@@ -17,8 +17,11 @@ func TestAssetName(t *testing.T) {
 		wantErr bool
 	}{
 		{goos: "linux", goarch: "amd64", want: "goplus-linux-amd64.tar.gz"},
+		{goos: "darwin", goarch: "amd64", want: "goplus-darwin-amd64.tar.gz"},
+		{goos: "darwin", goarch: "arm64", want: "goplus-darwin-arm64.tar.gz"},
 		{goos: "linux", goarch: "arm64", wantErr: true},
 		{goos: "windows", goarch: "amd64", wantErr: true},
+		{goos: "darwin", goarch: "386", wantErr: true},
 		{goos: "linux", goarch: "386", wantErr: true},
 	}
 	for _, test := range tests {

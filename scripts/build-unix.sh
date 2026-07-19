@@ -7,14 +7,44 @@ if (( $# != 5 )); then
 	exit 2
 fi
 
-source_root=$(realpath -- "$1")
+canonical_directory() {
+	(CDPATH= cd -- "$1" && pwd -P)
+}
+
+source_root=$(canonical_directory "$1")
 output_dir=$2
 version=$3
 tools_ref=$4
 gopls_ref=$5
-release_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+release_root=$(canonical_directory "$(dirname -- "${BASH_SOURCE[0]}")/..")
 
-for command in bash cc git tar; do
+case $(uname -s) in
+Linux) goos=linux ;;
+Darwin) goos=darwin ;;
+*)
+	echo "unsupported operating system: $(uname -s)" >&2
+	exit 1
+	;;
+esac
+
+case $(uname -m) in
+x86_64) goarch=amd64 ;;
+arm64 | aarch64) goarch=arm64 ;;
+*)
+	echo "unsupported architecture: $(uname -m)" >&2
+	exit 1
+	;;
+esac
+
+case $goos/$goarch in
+linux/amd64 | darwin/amd64 | darwin/arm64) ;;
+*)
+	echo "unsupported platform: $goos/$goarch" >&2
+	exit 1
+	;;
+esac
+
+for command in bash cc git tar uname; do
 	command -v "$command" >/dev/null 2>&1 || {
 		echo "missing required command: $command" >&2
 		exit 1
@@ -22,7 +52,7 @@ for command in bash cc git tar; do
 done
 
 mkdir -p "$output_dir"
-output_dir=$(realpath -- "$output_dir")
+output_dir=$(canonical_directory "$output_dir")
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 stage=$work/payload
@@ -60,6 +90,8 @@ private_go=$stage/go/bin/go
 export GOROOT=$stage/go
 export GOTOOLCHAIN=local
 export GOWORK=off
+test "$("$private_go" env GOHOSTOS)" = "$goos"
+test "$("$private_go" env GOHOSTARCH)" = "$goarch"
 (cd "$work/tools" && "$private_go" build -trimpath -o "$stage/libexec/goimports" ./cmd/goimports)
 (cd "$work/gopls-repo/gopls" && "$private_go" mod edit -replace="golang.org/x/tools=$work/tools")
 (cd "$work/gopls-repo/gopls" && "$private_go" build -trimpath -o "$stage/libexec/gopls" .)
@@ -74,9 +106,22 @@ rm "$stage/bin/goplus-launcher"
 "$stage/bin/go+" version
 "$stage/bin/gopls+" version
 
-archive=$output_dir/goplus-linux-amd64.tar.gz
-tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
-	-C "$stage" -czf "$archive" .goplus-managed bin go libexec
+archive=$output_dir/goplus-$goos-$goarch.tar.gz
+archive_tool=tar
+if [[ $goos == darwin ]] && command -v gtar >/dev/null 2>&1; then
+	archive_tool=gtar
+fi
+if "$archive_tool" --version 2>/dev/null | grep -q 'GNU tar'; then
+	COPYFILE_DISABLE=1 "$archive_tool" --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
+		-C "$stage" -czf "$archive" .goplus-managed bin go libexec
+else
+	COPYFILE_DISABLE=1 "$archive_tool" -C "$stage" -czf "$archive" .goplus-managed bin go libexec
+fi
 (cd "$release_root" && "$private_go" build -trimpath -ldflags="-s -w -X main.releaseTag=$version" \
-	-o "$output_dir/goplus-install-linux-amd64" ./cmd/install)
-"$output_dir/goplus-install-linux-amd64" -version
+	-o "$output_dir/goplus-install-$goos-$goarch" ./cmd/install)
+installer=$output_dir/goplus-install-$goos-$goarch
+"$installer" -version
+
+echo "Testing the packaged installation"
+"$installer" -archive "$archive" -prefix "$work/installed" -bin-dir "$work/bin"
+"$work/bin/go+" version
