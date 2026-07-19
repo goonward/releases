@@ -46,7 +46,7 @@ Use `go+` anywhere you would use `go`. The editor integrations use `gopls+`.
 ```go
 type Decision enum {
 	Allow
-	Deny(reason string)
+	Deny { Reason string }
 }
 
 try user := loadUser()
