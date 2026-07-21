@@ -63,7 +63,11 @@ echo "Building Go+"
 (cd "$source_root/src" && ./make.bash)
 test -x "$source_root/bin/go"
 test -x "$source_root/bin/gofmt"
-test -f "$source_root/VERSION.cache"
+version_file=$source_root/VERSION.cache
+if [[ ! -f $version_file ]]; then
+	version_file=$source_root/VERSION
+fi
+test -f "$version_file"
 
 for directory in api bin doc lib misc src test; do
 	cp -a "$source_root/$directory" "$stage/go/"
@@ -75,7 +79,7 @@ for file in CONTRIBUTING.md LICENSE PATENTS README.md SECURITY.md codereview.cfg
 		cp -a "$source_root/$file" "$stage/go/$file"
 	fi
 done
-cp -a "$source_root/VERSION.cache" "$stage/go/VERSION"
+cp -a "$version_file" "$stage/go/VERSION"
 
 echo "Building patched goimports and gopls"
 git clone --quiet --filter=blob:none --no-checkout https://go.googlesource.com/tools "$work/tools"

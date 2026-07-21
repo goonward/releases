@@ -59,7 +59,14 @@ try {
             Copy-Item -Force -LiteralPath $Path -Destination (Join-Path $StageGo $File)
         }
     }
-    Copy-Item -Force -LiteralPath (Join-Path $SourceRoot "VERSION.cache") -Destination (Join-Path $StageGo "VERSION")
+    $VersionFile = Join-Path $SourceRoot "VERSION.cache"
+    if (-not (Test-Path -LiteralPath $VersionFile -PathType Leaf)) {
+        $VersionFile = Join-Path $SourceRoot "VERSION"
+    }
+    if (-not (Test-Path -LiteralPath $VersionFile -PathType Leaf)) {
+        throw "Go source version file not found"
+    }
+    Copy-Item -Force -LiteralPath $VersionFile -Destination (Join-Path $StageGo "VERSION")
 
     Write-Host "Building patched goimports and gopls"
     $ToolsDir = Join-Path $Work "tools"
