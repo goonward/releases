@@ -276,6 +276,35 @@ jobs:
           echo "Published [$VERSION]($release_url)" >> "$GITHUB_STEP_SUMMARY"
           gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
 
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Update README release version
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERSION: ${{ needs.versions.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -E -i \
+            "s/^version=v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/version=$VERSION/" \
+            README.md
+
+          if [[ $(grep -Fxc "version=$VERSION" README.md) -ne 2 ]]; then
+            echo "failed to update both README install examples" >&2
+            exit 1
+          fi
+          if git diff --quiet -- README.md; then
+            exit
+          fi
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add README.md
+          git commit -m "docs: update install version to $VERSION"
+          git push origin "HEAD:$DEFAULT_BRANCH"
+
       - name: Clean up failed draft
         if: ${{ always() && steps.tag.outcome == 'success' && job.status != 'success' }}
         env:

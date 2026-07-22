@@ -10,7 +10,7 @@ live here.
 Linux amd64:
 
 ```sh
-version=v0.1.0-alpha.1
+version=v0.2.1
 curl -fLO "https://github.com/goonward/releases/releases/download/$version/goplus-install-linux-amd64"
 chmod +x goplus-install-linux-amd64
 ./goplus-install-linux-amd64
@@ -23,7 +23,7 @@ under `~/.local/share/goplus`, and links `go+`, `gofmt+`, `gopls+`, and
 macOS (Apple Silicon):
 
 ```sh
-version=v0.1.0-alpha.1
+version=v0.2.1
 curl -fLO "https://github.com/goonward/releases/releases/download/$version/goplus-install-darwin-arm64"
 chmod +x goplus-install-darwin-arm64
 ./goplus-install-darwin-arm64
